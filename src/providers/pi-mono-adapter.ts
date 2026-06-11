@@ -25,6 +25,7 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { type TSchema, Type } from "typebox";
+import { type AwsErrorClassification, classifyAwsSdkError } from "../utils/aws-error-classifier";
 import { scrubSecrets } from "../utils/secret-scrubber";
 import { readPkgVersion } from "./harness-version";
 import { createSwarmHooksExtension } from "./pi-mono-extension";
@@ -361,6 +362,15 @@ export class PiMonoSession implements ProviderSession {
    * surface it directly.
    */
   private prevOutputTokens = 0;
+  /** Accumulated raw_stderr content for the runner backstop (64 KB cap). */
+  private capturedStderr = "";
+  private static readonly MAX_CAPTURED_STDERR = 65_536;
+  /**
+   * Latest AWS SDK error classification from an auto_retry_start event.
+   * Set when a retry fires with an AWS error; used at session end to detect
+   * the silent-failure case (exits 0 with no output after exhausted retries).
+   */
+  private latestAwsError: AwsErrorClassification | null = null;
 
   constructor(agentSession: AgentSession, config: ProviderSessionConfig, createdSymlink: boolean) {
     this.agentSession = agentSession;
@@ -406,6 +416,14 @@ export class PiMonoSession implements ProviderSession {
       event.type === "raw_log" || event.type === "raw_stderr"
         ? { ...event, content: scrubSecrets(event.content) }
         : event;
+
+    // Accumulate raw_stderr for the runner backstop (64 KB cap)
+    if (
+      scrubbed.type === "raw_stderr" &&
+      this.capturedStderr.length < PiMonoSession.MAX_CAPTURED_STDERR
+    ) {
+      this.capturedStderr += scrubbed.content;
+    }
 
     // Log all events
     this.logFileHandle.write(
@@ -518,12 +536,19 @@ export class PiMonoSession implements ProviderSession {
           result: event.result,
         });
         break;
-      case "auto_retry_start":
+      case "auto_retry_start": {
+        // Classify the error for the terminal-failure check at session end.
+        // Do not emit {type:'error'} here — the retry may still succeed.
+        const awsRetryError = classifyAwsSdkError(event.errorMessage);
+        if (awsRetryError) {
+          this.latestAwsError = awsRetryError;
+        }
         this.emit({
           type: "raw_stderr",
           content: `[pi-mono] Auto-retry attempt ${event.attempt}/${event.maxAttempts}: ${event.errorMessage}\n`,
         });
         break;
+      }
     }
   }
 
@@ -541,6 +566,21 @@ export class PiMonoSession implements ProviderSession {
       const stats = this.agentSession.getSessionStats();
       const cost = this.buildCostData(stats);
 
+      // If all retries were AWS errors and the session produced no output,
+      // treat it as a terminal failure rather than "completed (no output)".
+      if (!this.lastAssistantText && this.latestAwsError) {
+        const { category, message } = this.latestAwsError;
+        this.emit({ type: "error", message, category });
+        return {
+          exitCode: 1,
+          sessionId: this._sessionId,
+          isError: true,
+          errorCategory: category,
+          failureReason: message,
+          rawStderr: this.capturedStderr || undefined,
+        };
+      }
+
       this.emit({
         type: "result",
         cost,
@@ -553,16 +593,29 @@ export class PiMonoSession implements ProviderSession {
         cost,
         output: this.lastAssistantText || undefined,
         isError: false,
+        rawStderr: this.capturedStderr || undefined,
       };
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
+      // Classify AWS SDK errors and emit a categorized error event so the
+      // session-chat red box fires exactly like sibling adapters (opencode, codex).
+      const awsCatchError = classifyAwsSdkError(errorMessage);
+      if (awsCatchError) {
+        this.emit({
+          type: "error",
+          message: awsCatchError.message,
+          category: awsCatchError.category,
+        });
+      }
       this.emit({ type: "raw_stderr", content: `[pi-mono] Error: ${errorMessage}\n` });
 
       return {
         exitCode: 1,
         sessionId: this._sessionId,
         isError: true,
-        failureReason: errorMessage,
+        errorCategory: awsCatchError?.category,
+        failureReason: awsCatchError?.message ?? errorMessage,
+        rawStderr: this.capturedStderr || undefined,
       };
     } finally {
       await this.logFileHandle.end();

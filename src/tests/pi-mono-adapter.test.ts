@@ -350,3 +350,244 @@ describe("Cost aggregation from SessionStats", () => {
     expect(cost.numTurns).toBe(0);
   });
 });
+
+// ============================================================================
+// AWS SDK error detection — PiMonoSession + classifyAwsSdkError integration
+// ============================================================================
+
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import { PiMonoSession } from "../providers/pi-mono-adapter";
+import type { ProviderEvent, ProviderResult, ProviderSessionConfig } from "../providers/types";
+import { classifyAwsSdkError } from "../utils/aws-error-classifier";
+
+/**
+ * Build a minimal ProviderSessionConfig pointing at a temp log file.
+ */
+function makeSessionConfig(logFile: string): ProviderSessionConfig {
+  return {
+    prompt: "test prompt",
+    systemPrompt: "",
+    model: "amazon-bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
+    role: "worker",
+    agentId: "test-agent-id",
+    taskId: "test-task-id",
+    apiUrl: "http://localhost:3013",
+    apiKey: "test-key",
+    cwd: "/tmp",
+    logFile,
+    iteration: 1,
+  };
+}
+
+type AgentSessionEvent = Parameters<Parameters<AgentSession["subscribe"]>[0]>[0];
+
+/**
+ * Create a minimal mock AgentSession.
+ *
+ * @param throwError   If set, `prompt()` throws with this message.
+ * @param autoRetryErrors  If set, `prompt()` fires auto_retry_start events before returning/throwing.
+ */
+function makeMockAgentSession(opts: {
+  throwError?: string;
+  autoRetryErrors?: string[];
+}): AgentSession {
+  const listeners: Array<(event: AgentSessionEvent) => void> = [];
+
+  return {
+    sessionId: "mock-session-id",
+    isStreaming: false,
+    model: undefined,
+    subscribe(listener: (event: AgentSessionEvent) => void) {
+      listeners.push(listener);
+      return () => {
+        const idx = listeners.indexOf(listener);
+        if (idx >= 0) listeners.splice(idx, 1);
+      };
+    },
+    async prompt() {
+      // Simulate auto_retry events before throwing / returning
+      if (opts.autoRetryErrors) {
+        for (let i = 0; i < opts.autoRetryErrors.length; i++) {
+          for (const l of listeners) {
+            l({
+              type: "auto_retry_start",
+              attempt: i + 1,
+              maxAttempts: opts.autoRetryErrors.length,
+              delayMs: 0,
+              errorMessage: opts.autoRetryErrors[i],
+            });
+          }
+        }
+      }
+      if (opts.throwError) throw new Error(opts.throwError);
+    },
+    getContextUsage: () => null,
+    getSessionStats: () => ({
+      tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      cost: 0,
+      userMessages: 0,
+      assistantMessages: 0,
+    }),
+    abort: async () => {},
+    dispose: () => {},
+  } as unknown as AgentSession;
+}
+
+const tmpLogDir = `/tmp/pi-mono-aws-test-${Date.now()}`;
+
+beforeAll(() => {
+  mkdirSync(tmpLogDir, { recursive: true });
+});
+
+afterAll(() => {
+  rmSync(tmpLogDir, { recursive: true, force: true });
+});
+
+describe("PiMonoSession — AWS error catch path (exception thrown from prompt())", () => {
+  async function runWithError(errorMessage: string): Promise<{
+    events: ProviderEvent[];
+    result: ProviderResult;
+  }> {
+    const logFile = join(
+      tmpLogDir,
+      `catch-${Date.now()}-${Math.random().toString(36).slice(2)}.log`,
+    );
+    const session = new PiMonoSession(
+      makeMockAgentSession({ throwError: errorMessage }),
+      makeSessionConfig(logFile),
+      false,
+    );
+    const events: ProviderEvent[] = [];
+    session.onEvent((e) => events.push(e));
+    const result = await session.waitForCompletion();
+    return { events, result };
+  }
+
+  test("ExpiredTokenException → {type:'error', category:'aws-auth'} + result.isError + result.errorCategory", async () => {
+    const { events, result } = await runWithError(
+      "ExpiredTokenException: The security token included in the request is expired",
+    );
+    const errorEvent = events.find((e) => e.type === "error");
+    expect(errorEvent).toBeDefined();
+    expect((errorEvent as Extract<ProviderEvent, { type: "error" }>).category).toBe("aws-auth");
+    expect(result.isError).toBe(true);
+    expect(result.errorCategory).toBe("aws-auth");
+    expect(result.exitCode).toBe(1);
+    expect(result.failureReason).toContain("aws sso login");
+  });
+
+  test("ThrottlingException → {type:'error', category:'aws-throttle'}", async () => {
+    const { events, result } = await runWithError("ThrottlingException: Rate exceeded");
+    const errorEvent = events.find((e) => e.type === "error") as Extract<
+      ProviderEvent,
+      { type: "error" }
+    >;
+    expect(errorEvent?.category).toBe("aws-throttle");
+    expect(result.errorCategory).toBe("aws-throttle");
+    expect(result.isError).toBe(true);
+  });
+
+  test("AccessDeniedException → {type:'error', category:'aws-access'}", async () => {
+    const { events, result } = await runWithError(
+      "AccessDeniedException: not authorized to perform: bedrock:InvokeModel",
+    );
+    const errorEvent = events.find((e) => e.type === "error") as Extract<
+      ProviderEvent,
+      { type: "error" }
+    >;
+    expect(errorEvent?.category).toBe("aws-access");
+    expect(result.errorCategory).toBe("aws-access");
+  });
+
+  test("ValidationException → {type:'error', category:'aws-model'}", async () => {
+    const { events, result } = await runWithError(
+      "ValidationException: Invocation of model ID x with on-demand throughput isn't supported",
+    );
+    const errorEvent = events.find((e) => e.type === "error") as Extract<
+      ProviderEvent,
+      { type: "error" }
+    >;
+    expect(errorEvent?.category).toBe("aws-model");
+    expect(result.errorCategory).toBe("aws-model");
+  });
+
+  test("non-AWS error does NOT emit {type:'error'} event", async () => {
+    const { events, result } = await runWithError("ECONNREFUSED 127.0.0.1:3013");
+    const errorEvent = events.find((e) => e.type === "error");
+    expect(errorEvent).toBeUndefined();
+    // Still fails (exitCode 1) but no typed error event
+    expect(result.isError).toBe(true);
+    expect(result.errorCategory).toBeUndefined();
+  });
+
+  test("AWS error sets rawStderr on ProviderResult", async () => {
+    const { result } = await runWithError("ExpiredTokenException: The security token is expired");
+    expect(result.rawStderr).toBeDefined();
+    expect(result.rawStderr).toContain("[pi-mono] Error:");
+  });
+});
+
+describe("PiMonoSession — AWS error silent-exit path (auto_retry + no output)", () => {
+  async function runWithAutoRetry(autoRetryErrors: string[]): Promise<{
+    events: ProviderEvent[];
+    result: ProviderResult;
+  }> {
+    const logFile = join(
+      tmpLogDir,
+      `autoretry-${Date.now()}-${Math.random().toString(36).slice(2)}.log`,
+    );
+    // Session that fires auto_retry_start events but does NOT throw (silent exit)
+    const session = new PiMonoSession(
+      makeMockAgentSession({ autoRetryErrors }),
+      makeSessionConfig(logFile),
+      false,
+    );
+    const events: ProviderEvent[] = [];
+    session.onEvent((e) => events.push(e));
+    const result = await session.waitForCompletion();
+    return { events, result };
+  }
+
+  test("ExpiredTokenException in auto_retry + no output → {type:'error'} + exitCode 1", async () => {
+    const { events, result } = await runWithAutoRetry([
+      "ExpiredTokenException: The security token included in the request is expired",
+    ]);
+    const errorEvent = events.find((e) => e.type === "error") as Extract<
+      ProviderEvent,
+      { type: "error" }
+    >;
+    expect(errorEvent).toBeDefined();
+    expect(errorEvent?.category).toBe("aws-auth");
+    expect(result.isError).toBe(true);
+    expect(result.errorCategory).toBe("aws-auth");
+    expect(result.exitCode).toBe(1);
+  });
+
+  test("ThrottlingException in auto_retry + no output → aws-throttle error event", async () => {
+    const { events, result } = await runWithAutoRetry([
+      "ThrottlingException: Rate exceeded",
+      "ThrottlingException: Rate exceeded",
+    ]);
+    const errorEvent = events.find((e) => e.type === "error") as Extract<
+      ProviderEvent,
+      { type: "error" }
+    >;
+    expect(errorEvent?.category).toBe("aws-throttle");
+    expect(result.errorCategory).toBe("aws-throttle");
+  });
+});
+
+describe("classifyAwsSdkError — all 4 categories (quick summary)", () => {
+  test("all four categories are reachable", () => {
+    const cases: Array<[string, string]> = [
+      ["ExpiredTokenException: token expired", "aws-auth"],
+      ["ThrottlingException: rate exceeded", "aws-throttle"],
+      ["AccessDeniedException: no permission", "aws-access"],
+      ["ValidationException: bad model", "aws-model"],
+    ];
+    for (const [msg, expected] of cases) {
+      const r = classifyAwsSdkError(msg);
+      expect(r?.category).toBe(expected);
+    }
+  });
+});

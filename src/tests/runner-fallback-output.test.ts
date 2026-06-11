@@ -449,3 +449,194 @@ describe("getBridgeFailureDiagnostics", () => {
     }
   });
 });
+
+// ============================================================================
+// AWS backstop: no-schema/no-progress branch scans rawStderr for AWS errors
+// ============================================================================
+
+describe("ensureTaskFinished — AWS backstop (rawStderr scan)", () => {
+  test("no output + ExpiredTokenException in rawStderr → task failed with aws-auth reason", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-aws-1",
+      task: "Bedrock task",
+      status: "in_progress",
+      output: null,
+      progress: null,
+      logs: [],
+    };
+
+    const rawStderr =
+      "[pi-mono] Auto-retry attempt 1/3: ExpiredTokenException: The security token included in the request is expired\n";
+
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-aws-1",
+      0, // exitCode 0 — the silent-failure case
+      undefined,
+      undefined,
+      "pi",
+      undefined, // failureDiagnostics
+      rawStderr,
+    );
+
+    expect(lastFinishBody).toBeTruthy();
+    expect(lastFinishBody!.status).toBe("failed");
+    expect(lastFinishBody!.failureReason).toContain("aws-auth");
+    expect(lastFinishBody!.failureReason).toContain("aws sso login");
+  });
+
+  test("no output + ThrottlingException in rawStderr → task failed with aws-throttle reason", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-aws-2",
+      task: "Bedrock task",
+      status: "in_progress",
+      output: null,
+      progress: null,
+      logs: [],
+    };
+
+    const rawStderr = "[pi-mono] Error: ThrottlingException: Rate exceeded\n";
+
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-aws-2",
+      0,
+      undefined,
+      undefined,
+      "pi",
+      undefined, // failureDiagnostics
+      rawStderr,
+    );
+
+    expect(lastFinishBody!.status).toBe("failed");
+    expect(lastFinishBody!.failureReason).toContain("aws-throttle");
+  });
+
+  test("no output + AccessDeniedException in rawStderr → task failed with aws-access reason", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-aws-3",
+      task: "Bedrock task",
+      status: "in_progress",
+      output: null,
+      progress: null,
+      logs: [],
+    };
+
+    const rawStderr =
+      "[pi-mono] Error: AccessDeniedException: not authorized to perform: bedrock:InvokeModel\n";
+
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-aws-3",
+      0,
+      undefined,
+      undefined,
+      "pi",
+      undefined, // failureDiagnostics
+      rawStderr,
+    );
+
+    expect(lastFinishBody!.status).toBe("failed");
+    expect(lastFinishBody!.failureReason).toContain("aws-access");
+  });
+
+  test("no output + non-AWS rawStderr → still emits 'no output captured'", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-aws-4",
+      task: "Some task",
+      status: "in_progress",
+      output: null,
+      progress: null,
+      logs: [],
+    };
+
+    const rawStderr = "[pi-mono] some unrecognized error message\n";
+
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-aws-4",
+      0,
+      undefined,
+      undefined,
+      "pi",
+      undefined, // failureDiagnostics
+      rawStderr,
+    );
+
+    // Non-AWS error should NOT trigger the backstop reclassification
+    expect(lastFinishBody!.status).toBe("completed");
+    expect(lastFinishBody!.output).toBe("Process completed successfully (no output captured)");
+  });
+
+  test("backstop does NOT fire when lastProgress is set (progress beats rawStderr scan)", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-aws-5",
+      task: "Some task",
+      status: "in_progress",
+      output: null,
+      progress: null,
+      logs: [
+        {
+          eventType: "task_progress",
+          newValue: "Did some work",
+          createdAt: "2025-01-01T00:00:00Z",
+        },
+      ],
+    };
+
+    // Even with an AWS error in stderr, if there's progress, we use the progress
+    const rawStderr = "[pi-mono] Error: ExpiredTokenException: token expired\n";
+
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-aws-5",
+      0,
+      undefined,
+      undefined,
+      "pi",
+      undefined, // failureDiagnostics
+      rawStderr,
+    );
+
+    // Progress takes priority — task completes with the progress output
+    expect(lastFinishBody!.status).toBe("completed");
+    expect(lastFinishBody!.output).toBe("Did some work");
+  });
+
+  test("rawStderr=undefined falls through to original 'no output captured'", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-aws-6",
+      task: "Some task",
+      status: "in_progress",
+      output: null,
+      progress: null,
+      logs: [],
+    };
+
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-aws-6",
+      0,
+      undefined,
+      undefined,
+      "pi",
+      undefined, // failureDiagnostics
+      undefined, // no rawStderr
+    );
+
+    expect(lastFinishBody!.status).toBe("completed");
+    expect(lastFinishBody!.output).toBe("Process completed successfully (no output captured)");
+  });
+});

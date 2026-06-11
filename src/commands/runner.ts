@@ -36,6 +36,7 @@ import {
 import { initTelemetry, telemetry } from "../telemetry.ts";
 import type { ProviderName, RepoGuidelines } from "../types.ts";
 import { getApiKey } from "../utils/api-key.ts";
+import { classifyAwsSdkError } from "../utils/aws-error-classifier.ts";
 import { computeBudgetBackoffMs } from "../utils/budget-backoff.ts";
 import { getMcpBaseUrl } from "../utils/constants.ts";
 import { getContextWindowSize } from "../utils/context-window.ts";
@@ -877,6 +878,12 @@ export async function ensureTaskFinished(
    */
   provider?: ProviderName,
   failureDiagnostics?: string,
+  /**
+   * Accumulated raw_stderr content from the provider session.  Used by the
+   * backstop scan in the no-schema/no-progress branch to detect AWS SDK errors
+   * that never surfaced as structured ProviderEvents.
+   */
+  rawStderr?: string,
 ): Promise<void> {
   const headers: Record<string, string> = {
     "X-Agent-ID": config.agentId,
@@ -923,7 +930,18 @@ export async function ensureTaskFinished(
         if (fallback.lastProgress) {
           body.output = fallback.lastProgress.slice(0, 2000);
         } else {
-          body.output = "Process completed successfully (no output captured)";
+          // Backstop: before emitting the generic "no output captured" message,
+          // scan accumulated raw_stderr for AWS SDK error signatures.  Covers
+          // silent failures where the pi-mono adapter exits 0 but never emitted
+          // a structured {type:'error'} ProviderEvent.
+          const awsBackstop = rawStderr ? classifyAwsSdkError(rawStderr) : null;
+          if (awsBackstop) {
+            status = "failed";
+            body.status = "failed";
+            body.failureReason = `AWS Bedrock error (${awsBackstop.category}): ${awsBackstop.message}`;
+          } else {
+            body.output = "Process completed successfully (no output captured)";
+          }
         }
         break;
       }
@@ -3427,6 +3445,7 @@ async function checkCompletedProcesses(
         result.output,
         harnessProvider,
         bridgeFailureDiagnostics,
+        result.rawStderr,
       );
 
       if (result.exitCode === 0 && credentialInfo) {

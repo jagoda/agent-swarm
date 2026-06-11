@@ -137,6 +137,12 @@ export interface ProviderResult {
    * three-tier cooldown resolver.
    */
   rateLimitResetAt?: string;
+  /**
+   * Accumulated raw_stderr content emitted during the session, capped at 64 KB.
+   * Populated by the pi-mono adapter so the runner backstop can scan for AWS SDK
+   * error signatures even when they did not surface as structured ProviderEvents.
+   */
+  rawStderr?: string;
 }
 
 /** Behavioral traits that govern prompt assembly and feature gating. */
